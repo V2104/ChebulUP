@@ -1,4 +1,4 @@
-# CUP — Chebul Acoustic Protocol  
+# ChebulUP
 Надёжная передача данных через акустический канал (ggwave)
 
 ---
