@@ -1,5 +1,3 @@
-
-```markdown
 # CUP — Chebul Acoustic Protocol  
 Надёжная передача данных через акустический канал (ggwave)
 
@@ -58,8 +56,6 @@
 
 ## 4. Архитектура (логическая)
 
-```
-
 Application bytes
 ↓
 Message Fragmentation
@@ -71,8 +67,6 @@ Stop-and-Wait ARQ (ACK / timeout / retry)
 Base64 wrapper (bytes → str)
 ↓
 ggwave PHY (FSK + RS)
-
-```
 
 ---
 
@@ -109,8 +103,6 @@ ggwave PHY (FSK + RS)
 
 ## 6. Структура репозитория
 
-```
-
 CUP/
 ├── README.md
 ├── .gitignore
@@ -123,8 +115,6 @@ CUP/
 ├── test_fragment_over_phy.py   # фрагментация + сборка
 ├── arq_stop_and_wait.py        # stop-and-wait ARQ поверх PHY
 └── measure_arq.py              # измерения и сетка параметров
-
-````
 
 ---
 
