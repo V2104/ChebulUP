@@ -1,9 +1,4 @@
-Отлично, тогда давай **зафиксируем всё одним цельным README**, без “см. выше”, без фрагментов и недомолвок. Ниже — **полная версия**, которую можно **просто скопировать целиком** в `CUP/README.md` и коммитить. Тон — честный, инженерный, без маркетинга и без иллюзий.
-
----
-
-```markdown
-# CUP — Chebul Acoustic Protocol  
+# ChebulUP
 Надёжная передача данных через акустический канал (ggwave)
 
 ---
@@ -61,8 +56,6 @@
 
 ## 4. Архитектура (логическая)
 
-```
-
 Application bytes
 ↓
 Message Fragmentation
@@ -74,8 +67,6 @@ Stop-and-Wait ARQ (ACK / timeout / retry)
 Base64 wrapper (bytes → str)
 ↓
 ggwave PHY (FSK + RS)
-
-```
 
 ---
 
@@ -112,8 +103,6 @@ ggwave PHY (FSK + RS)
 
 ## 6. Структура репозитория
 
-```
-
 CUP/
 ├── README.md
 ├── .gitignore
@@ -126,8 +115,6 @@ CUP/
 ├── test_fragment_over_phy.py   # фрагментация + сборка
 ├── arq_stop_and_wait.py        # stop-and-wait ARQ поверх PHY
 └── measure_arq.py              # измерения и сетка параметров
-
-````
 
 ---
 
@@ -256,5 +243,4 @@ python -m scripts.measure_arq
 
 Учебный проект.
 (Лицензия может быть добавлена позже при необходимости.)
-
 
