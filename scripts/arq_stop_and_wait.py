@@ -1,53 +1,108 @@
 from __future__ import annotations
 
 import base64
+import os
 import random
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+
 import ggwave
 
-from scripts.baseline_ggwave_file import init_rx, decode_two_ways, SR, PROTOCOL_ID
 from scripts.ggwave_codec import encoded_bytes_to_f32
 from scripts.packet import (
-    fragment_message, unpack_frame, reassemble_frames,
-    pack_ack, TYPE_DATA, TYPE_ACK
+    TYPE_ACK,
+    TYPE_DATA,
+    fragment_message,
+    pack_ack,
+    reassemble_frames,
+    unpack_frame,
 )
 
-# --- PHY helpers (строка через ggwave) ---
+SR = 48000
+PROTOCOL_ID = 0
+
+
+@contextmanager
+def suppress_c_stdout_stderr():
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    old_stdout = os.dup(1)
+    old_stderr = os.dup(2)
+    try:
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        os.dup2(old_stdout, 1)
+        os.dup2(old_stderr, 2)
+        os.close(old_stdout)
+        os.close(old_stderr)
+        os.close(devnull)
+
+
+try:
+    if hasattr(ggwave, "disableLog"):
+        ggwave.disableLog()
+except Exception:
+    pass
+
+
+def init_rx():
+    params = ggwave.getDefaultParameters()
+    if hasattr(params, "sampleRateInp"):
+        params.sampleRateInp = float(SR)
+    if hasattr(params, "sampleRateOut"):
+        params.sampleRateOut = float(SR)
+    return ggwave.init(params)
+
+
+def free_rx(inst):
+    if hasattr(ggwave, "free"):
+        try:
+            ggwave.free(inst)
+        except Exception:
+            pass
+
 
 def phy_encode_text(text: str) -> bytes:
-    return ggwave.encode(text, protocolId=PROTOCOL_ID, volume=10)
-
-def phy_decode_text(inst_rx, samples_bytes: bytes) -> str | None:
-    samples_f32 = encoded_bytes_to_f32(samples_bytes)
-    decoded = decode_two_ways(inst_rx, samples_f32)
-    if decoded is None:
-        return None
-    return decoded.decode("ascii", errors="strict")
+    with suppress_c_stdout_stderr():
+        return ggwave.encode(text, protocolId=PROTOCOL_ID, volume=10)
 
 
-def bytes_frame_to_text(frame: bytes) -> str:
-    return base64.b64encode(frame).decode("ascii")
+def phy_decode_b64bytes(inst_rx, phy_samples: bytes) -> bytes | None:
+    samples_f32 = encoded_bytes_to_f32(phy_samples)
 
-def text_to_bytes_frame(text: str) -> bytes:
-    return base64.b64decode(text.encode("ascii"))
+    # 1) ndarray
+    try:
+        with suppress_c_stdout_stderr():
+            d = ggwave.decode(inst_rx, samples_f32)
+        if d:
+            return d
+    except Exception:
+        pass
 
+    # 2) bytes one-shot
+    try:
+        with suppress_c_stdout_stderr():
+            d = ggwave.decode(inst_rx, samples_f32.tobytes())
+        if d:
+            return d
+    except Exception:
+        pass
 
-# --- Simulated unreliable channel ---
+    return None
+
 
 class UnreliableChannel:
-    def __init__(self, drop_prob: float = 0.2, delay_ms: int = 0):
-        self.drop_prob = drop_prob
-        self.delay_ms = delay_ms
+    def __init__(self, drop_prob: float):
+        self.drop_prob = float(drop_prob)
         self.queue: list[bytes] = []
 
-    def send(self, phy_samples: bytes):
-        # drop
+    def send(self, item: bytes) -> bool:
         if random.random() < self.drop_prob:
-            return
-        # delay (optional)
-        if self.delay_ms > 0:
-            time.sleep(self.delay_ms / 1000.0)
-        self.queue.append(phy_samples)
+            return False
+        self.queue.append(item)
+        return True
 
     def recv(self) -> bytes | None:
         if not self.queue:
@@ -55,162 +110,166 @@ class UnreliableChannel:
         return self.queue.pop(0)
 
 
-# --- Stop-and-Wait ARQ over frames ---
+@dataclass
+class RunResult:
+    ok: bool
+    seconds: float
+    goodput_Bps: float
+    frames_total: int
+    retries_total: int
+    data_sent: int
+    data_dropped: int
+    ack_sent: int
+    ack_dropped: int
 
-def sender_send_message(channel_data: UnreliableChannel, channel_ack: UnreliableChannel, payload: bytes,
-                        *, msg_id: int = 1, max_payload: int = 16, timeout_s: float = 1.0, max_retries: int = 10):
-    frames = fragment_message(payload, msg_id=msg_id, max_payload=max_payload)
 
+class ReceiverState:
+    def __init__(self, msg_id: int):
+        self.msg_id = msg_id
+        self.got_parts: dict[int, bytes] = {}
+        self.expected_total: int | None = None
+        self.assembled: bytes | None = None
+
+    def on_data_frame(self, raw_frame: bytes):
+        ft, mid, seq, total, payload = unpack_frame(raw_frame)
+        if ft != TYPE_DATA or mid != self.msg_id:
+            return None
+
+        if self.expected_total is None:
+            self.expected_total = total
+
+        self.got_parts[seq] = payload
+        assembled = reassemble_frames(self.got_parts, self.expected_total)
+        if assembled is not None:
+            self.assembled = assembled
+
+        return (mid, seq, total)
+
+
+def run_once(
+    *,
+    payload: bytes,
+    drop_data: float,
+    drop_ack: float,
+    max_payload: int,
+    timeout_s: float,
+    max_retries: int,
+    seed: int,
+    msg_id: int = 1,
+) -> RunResult:
+    random.seed(seed)
+
+    data_ch = UnreliableChannel(drop_data)
+    ack_ch = UnreliableChannel(drop_ack)
+
+    inst_rx_data = init_rx()
     inst_rx_ack = init_rx()
+
+    counters = {
+        "retries_total": 0,
+        "data_sent": 0,
+        "data_dropped": 0,
+        "ack_sent": 0,
+        "ack_dropped": 0,
+    }
+
+    rx = ReceiverState(msg_id=msg_id)
+
+    def receiver_pump():
+        while True:
+            samples = data_ch.recv()
+            if samples is None:
+                break
+
+            decoded_b64 = phy_decode_b64bytes(inst_rx_data, samples)
+            if decoded_b64 is None:
+                continue
+
+            try:
+                raw_frame = base64.b64decode(decoded_b64)
+                ack_info = rx.on_data_frame(raw_frame)
+                if ack_info is None:
+                    continue
+
+                mid, seq, total = ack_info
+                ack_frame = pack_ack(msg_id=mid, seq=seq, total=total)
+                ack_text = base64.b64encode(ack_frame).decode("ascii")
+
+                counters["ack_sent"] += 1
+                if not ack_ch.send(phy_encode_text(ack_text)):
+                    counters["ack_dropped"] += 1
+            except Exception:
+                continue
+
+    def sender_wait_ack(seq: int, total: int, deadline: float) -> bool:
+        while time.time() < deadline:
+            receiver_pump()
+
+            ack_samples = ack_ch.recv()
+            if ack_samples is None:
+                time.sleep(0.001)
+                continue
+
+            decoded_b64_ack = phy_decode_b64bytes(inst_rx_ack, ack_samples)
+            if decoded_b64_ack is None:
+                continue
+
+            try:
+                ack_frame = base64.b64decode(decoded_b64_ack)
+                aft, amid, aseq, atotal, _ = unpack_frame(ack_frame)
+                if aft == TYPE_ACK and amid == msg_id and aseq == seq and atotal == total:
+                    return True
+            except Exception:
+                continue
+
+        return False
+
+    t0 = time.time()
     try:
+        frames = fragment_message(payload, msg_id=msg_id, max_payload=max_payload)
+        frames_total = len(frames)
+
         for raw_frame in frames:
-            # узнаем seq/total (чтобы ждать правильный ack)
             ft, mid, seq, total, _ = unpack_frame(raw_frame)
+            if ft != TYPE_DATA or mid != msg_id:
+                raise RuntimeError("Unexpected frame in fragmentation result")
 
-            if ft != TYPE_DATA:
-                raise RuntimeError("expected DATA frame")
-
-            text = bytes_frame_to_text(raw_frame)
+            data_text = base64.b64encode(raw_frame).decode("ascii")
 
             retries = 0
             while True:
-                # отправляем DATA
-                channel_data.send(phy_encode_text(text))
+                counters["data_sent"] += 1
+                if not data_ch.send(phy_encode_text(data_text)):
+                    counters["data_dropped"] += 1
 
-                # ждём ACK
-                deadline = time.time() + timeout_s
-                got_ack = False
-                while time.time() < deadline:
-                    ack_samples = channel_ack.recv()
-                    if ack_samples is None:
-                        time.sleep(0.01)
-                        continue
+                receiver_pump()
 
-                    ack_text = phy_decode_text(inst_rx_ack, ack_samples)
-                    if ack_text is None:
-                        continue
-
-                    ack_frame = text_to_bytes_frame(ack_text)
-                    aft, amid, aseq, atotal, _apayload = unpack_frame(ack_frame)
-                    if aft == TYPE_ACK and amid == msg_id and aseq == seq and atotal == total:
-                        got_ack = True
-                        break
-
+                got_ack = sender_wait_ack(seq, total, time.time() + float(timeout_s))
                 if got_ack:
-                    print(f"SENDER: seq={seq}/{total-1} ACK")
                     break
 
                 retries += 1
-                print(f"SENDER: seq={seq}/{total-1} timeout, retry {retries}/{max_retries}")
+                counters["retries_total"] += 1
                 if retries >= max_retries:
-                    raise RuntimeError(f"SENDER failed: too many retries on seq={seq}")
+                    raise RuntimeError(f"Too many retries on seq={seq}/{total-1}")
 
+        receiver_pump()
+
+        seconds = max(1e-9, time.time() - t0)
+        ok = (rx.assembled == payload)
+        goodput = (len(payload) / seconds) if ok else 0.0
+
+        return RunResult(
+            ok=ok,
+            seconds=seconds,
+            goodput_Bps=goodput,
+            frames_total=frames_total,
+            retries_total=counters["retries_total"],
+            data_sent=counters["data_sent"],
+            data_dropped=counters["data_dropped"],
+            ack_sent=counters["ack_sent"],
+            ack_dropped=counters["ack_dropped"],
+        )
     finally:
-        if hasattr(ggwave, "free"):
-            try:
-                ggwave.free(inst_rx_ack)
-            except Exception:
-                pass
-
-
-def receiver_run(channel_data: UnreliableChannel, channel_ack: UnreliableChannel,
-                 *, msg_id: int = 1, grace_after_assembled_s: float = 2.0):
-    inst_rx_data = init_rx()
-    try:
-        got_parts: dict[int, bytes] = {}
-        expected_total: int | None = None
-
-        assembled_data: bytes | None = None
-        assembled_at: float | None = None
-
-        while True:
-            # Если уже собрали — работаем ещё чуть-чуть как "ACK-сервис", потом выходим
-            if assembled_data is not None and assembled_at is not None:
-                if time.time() - assembled_at >= grace_after_assembled_s:
-                    return assembled_data
-
-            samples = channel_data.recv()
-            if samples is None:
-                time.sleep(0.01)
-                continue
-
-            text = phy_decode_text(inst_rx_data, samples)
-            if text is None:
-                continue
-
-            raw_frame = text_to_bytes_frame(text)
-            ft, mid, seq, total, payload = unpack_frame(raw_frame)
-
-            if ft != TYPE_DATA or mid != msg_id:
-                continue
-
-            # сохраняем часть (повторы допускаем)
-            if expected_total is None:
-                expected_total = total
-            got_parts[seq] = payload
-
-            # шлём ACK всегда (и на повторы тоже)
-            ack = pack_ack(msg_id=mid, seq=seq, total=total)
-            channel_ack.send(phy_encode_text(bytes_frame_to_text(ack)))
-            print(f"RECV: got seq={seq}/{total-1}, sent ACK")
-
-            # проверяем сборку
-            assembled = reassemble_frames(got_parts, expected_total)
-            if assembled is not None and assembled_data is None:
-                assembled_data = assembled
-                assembled_at = time.time()
-                print(f"RECV: assembled len={len(assembled_data)}")
-
-    finally:
-        if hasattr(ggwave, "free"):
-            try:
-                ggwave.free(inst_rx_data)
-            except Exception:
-                pass
-
-
-def main():
-    random.seed(1)
-
-    # Два канала: данные и ACK (оба ненадёжные)
-    data_ch = UnreliableChannel(drop_prob=0.25)
-    ack_ch = UnreliableChannel(drop_prob=0.10)
-
-    payload = b"hello world! " * 10
-
-    # Запускаем receiver в "ручном" режиме: в одном потоке будем шагать
-    # (без threading, чтобы проще отлаживать)
-    # Хитрость: сначала посылаем sender, а receiver будет забирать из очереди в процессе.
-    #
-    # Для простоты делаем так:
-    # 1) sender пытается отправить кадр
-    # 2) receiver крутится и отвечает ACK
-    #
-    # Реализуем это через interleave: sender вызывает send(), receiver тут же читаeт.
-
-    # Чтобы не усложнять, делаем receiver в фоне через простую петлю,
-    # а sender будет "подливать" данные.
-    import threading
-    result_holder = {"data": None, "err": None}
-
-    def recv_thread():
-        try:
-            result_holder["data"] = receiver_run(data_ch, ack_ch, msg_id=1)
-        except Exception as e:
-            result_holder["err"] = e
-
-    t = threading.Thread(target=recv_thread, daemon=True)
-    t.start()
-
-    sender_send_message(data_ch, ack_ch, payload, msg_id=1, max_payload=16, timeout_s=0.8, max_retries=20)
-
-    t.join(timeout=10)
-    if result_holder["err"]:
-        raise result_holder["err"]
-
-    received = result_holder["data"]
-    print("FINAL:", "OK" if received == payload else "FAIL")
-
-
-if __name__ == "__main__":
-    main()
+        free_rx(inst_rx_data)
+        free_rx(inst_rx_ack)

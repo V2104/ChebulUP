@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import statistics as stats
 
-from scripts.measure_arq import run_once, RunResult  # re-use real ggwave run_once
+from scripts.arq_stop_and_wait import run_once, RunResult  # re-use real ggwave run_once
 
 
 def pctl(vals, q):
