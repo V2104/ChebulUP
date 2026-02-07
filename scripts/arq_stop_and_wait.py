@@ -22,6 +22,8 @@ from scripts.packet import (
 SR = 48000
 PROTOCOL_ID = 0
 
+_B64_ALPH = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
 
 @contextmanager
 def suppress_c_stdout_stderr():
@@ -47,6 +49,34 @@ except Exception:
     pass
 
 
+def corrupt_b64_ascii(b: bytes) -> bytes:
+    """
+    Corrupt an ASCII base64 string by replacing one character.
+    Goal: produce valid base64 that decodes into "wrong bytes" -> CRC fails.
+    """
+    if not b:
+        return b
+
+    s = bytearray(b)
+
+    # pick position not at very end '=' if possible
+    if len(s) > 2:
+        i = random.randrange(len(s) - 1)
+    else:
+        i = 0
+
+    # avoid corrupting '=' padding char if it's there
+    if s[i] == ord("=") and len(s) > 1:
+        i = max(0, i - 1)
+
+    old = s[i]
+    new = ord(_B64_ALPH[random.randrange(len(_B64_ALPH))])
+    if new == old:
+        new = ord(_B64_ALPH[(random.randrange(len(_B64_ALPH)) + 1) % len(_B64_ALPH)])
+    s[i] = new
+    return bytes(s)
+
+
 def init_rx():
     params = ggwave.getDefaultParameters()
     if hasattr(params, "sampleRateInp"):
@@ -70,6 +100,10 @@ def phy_encode_text(text: str) -> bytes:
 
 
 def phy_decode_b64bytes(inst_rx, phy_samples: bytes) -> bytes | None:
+    """
+    Decode ggwave samples into base64 ASCII bytes (the transmitted text),
+    or None if nothing decoded.
+    """
     samples_f32 = encoded_bytes_to_f32(phy_samples)
 
     # 1) ndarray
@@ -94,6 +128,9 @@ def phy_decode_b64bytes(inst_rx, phy_samples: bytes) -> bytes | None:
 
 
 class UnreliableChannel:
+    """
+    Drop-only channel (for DATA and ACK separately).
+    """
     def __init__(self, drop_prob: float):
         self.drop_prob = float(drop_prob)
         self.queue: list[bytes] = []
@@ -117,6 +154,7 @@ class RunResult:
     goodput_Bps: float
     frames_total: int
     retries_total: int
+    crc_fail_total: int
     data_sent: int
     data_dropped: int
     ack_sent: int
@@ -139,6 +177,7 @@ class ReceiverState:
             self.expected_total = total
 
         self.got_parts[seq] = payload
+
         assembled = reassemble_frames(self.got_parts, self.expected_total)
         if assembled is not None:
             self.assembled = assembled
@@ -156,7 +195,13 @@ def run_once(
     max_retries: int,
     seed: int,
     msg_id: int = 1,
+    corrupt_data_prob: float = 0.0,
+    corrupt_ack_prob: float = 0.0,
 ) -> RunResult:
+    """
+    One full stop-and-wait transfer over ggwave PHY (in-memory),
+    with independent drop and corruption (corrupt -> CRC fail) models.
+    """
     random.seed(seed)
 
     data_ch = UnreliableChannel(drop_data)
@@ -167,6 +212,7 @@ def run_once(
 
     counters = {
         "retries_total": 0,
+        "crc_fail_total": 0,
         "data_sent": 0,
         "data_dropped": 0,
         "ack_sent": 0,
@@ -176,6 +222,9 @@ def run_once(
     rx = ReceiverState(msg_id=msg_id)
 
     def receiver_pump():
+        """
+        Process all pending DATA packets and emit ACKs.
+        """
         while True:
             samples = data_ch.recv()
             if samples is None:
@@ -184,6 +233,10 @@ def run_once(
             decoded_b64 = phy_decode_b64bytes(inst_rx_data, samples)
             if decoded_b64 is None:
                 continue
+
+            # corrupt decoded text (simulate PHY bit errors)
+            if corrupt_data_prob > 0.0 and random.random() < corrupt_data_prob:
+                decoded_b64 = corrupt_b64_ascii(decoded_b64)
 
             try:
                 raw_frame = base64.b64decode(decoded_b64)
@@ -198,10 +251,16 @@ def run_once(
                 counters["ack_sent"] += 1
                 if not ack_ch.send(phy_encode_text(ack_text)):
                     counters["ack_dropped"] += 1
+
             except Exception:
+                # base64/CRC/parse failures
+                counters["crc_fail_total"] += 1
                 continue
 
     def sender_wait_ack(seq: int, total: int, deadline: float) -> bool:
+        """
+        While waiting for ACK, keep pumping receiver, and check ACK queue.
+        """
         while time.time() < deadline:
             receiver_pump()
 
@@ -214,12 +273,18 @@ def run_once(
             if decoded_b64_ack is None:
                 continue
 
+            # corrupt decoded ACK text
+            if corrupt_ack_prob > 0.0 and random.random() < corrupt_ack_prob:
+                decoded_b64_ack = corrupt_b64_ascii(decoded_b64_ack)
+
             try:
                 ack_frame = base64.b64decode(decoded_b64_ack)
                 aft, amid, aseq, atotal, _ = unpack_frame(ack_frame)
                 if aft == TYPE_ACK and amid == msg_id and aseq == seq and atotal == total:
                     return True
             except Exception:
+                # CRC/base64/etc. for ACK parsing
+                counters["crc_fail_total"] += 1
                 continue
 
         return False
@@ -265,6 +330,7 @@ def run_once(
             goodput_Bps=goodput,
             frames_total=frames_total,
             retries_total=counters["retries_total"],
+            crc_fail_total=counters["crc_fail_total"],
             data_sent=counters["data_sent"],
             data_dropped=counters["data_dropped"],
             ack_sent=counters["ack_sent"],
