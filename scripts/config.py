@@ -15,3 +15,7 @@ DEFAULT_MAX_PAYLOAD = 32
 DEFAULT_TIMEOUT_S = 0.2         # for ggwave runner
 DEFAULT_TIMEOUT_MS = 50         # for fast-sim
 DEFAULT_MAX_RETRIES = 50
+# Default protocol params
+DEFAULT_WINDOW = 4
+ACCOUNT_PHY_TIME = True
+

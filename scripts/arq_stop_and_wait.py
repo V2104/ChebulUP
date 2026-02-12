@@ -94,9 +94,21 @@ def free_rx(inst):
             pass
 
 
-def phy_encode_text(text: str) -> bytes:
+def phy_encode_text(text: str) -> tuple[bytes, float]:
+    """
+    Encode text to ggwave samples + estimate its duration (seconds).
+    Duration is estimated from decoded float32 PCM length.
+    """
     with suppress_c_stdout_stderr():
-        return ggwave.encode(text, protocolId=PROTOCOL_ID, volume=10)
+        samples = ggwave.encode(text, protocolId=PROTOCOL_ID, volume=10)
+
+    try:
+        pcm = encoded_bytes_to_f32(samples)
+        dur_s = float(len(pcm)) / float(SR)
+    except Exception:
+        dur_s = 0.0
+
+    return samples, dur_s
 
 
 def phy_decode_b64bytes(inst_rx, phy_samples: bytes) -> bytes | None:
@@ -131,6 +143,7 @@ class UnreliableChannel:
     """
     Drop-only channel (for DATA and ACK separately).
     """
+
     def __init__(self, drop_prob: float):
         self.drop_prob = float(drop_prob)
         self.queue: list[bytes] = []
@@ -159,6 +172,11 @@ class RunResult:
     data_dropped: int
     ack_sent: int
     ack_dropped: int
+
+    # NEW: "realistic" accounting
+    phy_seconds: float
+    virtual_seconds: float
+    goodput_virtual_Bps: float
 
 
 class ReceiverState:
@@ -219,12 +237,17 @@ def run_once(
         "ack_dropped": 0,
     }
 
+    # NEW: sum of durations of every "sent" PHY waveform (both DATA+ACK)
+    phy_seconds = 0.0
+
     rx = ReceiverState(msg_id=msg_id)
 
     def receiver_pump():
         """
         Process all pending DATA packets and emit ACKs.
         """
+        nonlocal phy_seconds
+
         while True:
             samples = data_ch.recv()
             if samples is None:
@@ -248,8 +271,11 @@ def run_once(
                 ack_frame = pack_ack(msg_id=mid, seq=seq, total=total)
                 ack_text = base64.b64encode(ack_frame).decode("ascii")
 
+                samples_ack, dur_s = phy_encode_text(ack_text)
+                phy_seconds += dur_s
+
                 counters["ack_sent"] += 1
-                if not ack_ch.send(phy_encode_text(ack_text)):
+                if not ack_ch.send(samples_ack):
                     counters["ack_dropped"] += 1
 
             except Exception:
@@ -303,8 +329,11 @@ def run_once(
 
             retries = 0
             while True:
+                samples_data, dur_s = phy_encode_text(data_text)
+                phy_seconds += dur_s
+
                 counters["data_sent"] += 1
-                if not data_ch.send(phy_encode_text(data_text)):
+                if not data_ch.send(samples_data):
                     counters["data_dropped"] += 1
 
                 receiver_pump()
@@ -324,6 +353,11 @@ def run_once(
         ok = (rx.assembled == payload)
         goodput = (len(payload) / seconds) if ok else 0.0
 
+        # Virtual / realistic: PHY time + timeouts
+        virtual_seconds = phy_seconds + float(counters["retries_total"]) * float(timeout_s)
+        virtual_seconds = max(1e-9, virtual_seconds)
+        goodput_virtual = (len(payload) / virtual_seconds) if ok else 0.0
+
         return RunResult(
             ok=ok,
             seconds=seconds,
@@ -335,7 +369,11 @@ def run_once(
             data_dropped=counters["data_dropped"],
             ack_sent=counters["ack_sent"],
             ack_dropped=counters["ack_dropped"],
+            phy_seconds=phy_seconds,
+            virtual_seconds=virtual_seconds,
+            goodput_virtual_Bps=goodput_virtual,
         )
     finally:
         free_rx(inst_rx_data)
         free_rx(inst_rx_ack)
+
